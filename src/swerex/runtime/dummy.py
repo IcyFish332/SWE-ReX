@@ -14,6 +14,7 @@ from swerex.runtime.abstract import (
     CloseSessionResponse,
     Command,
     CommandResponse,
+    CancelResponse,
     CreateBashSessionResponse,
     CreateSessionRequest,
     CreateSessionResponse,
@@ -80,6 +81,9 @@ class DummyRuntime(AbstractRuntime):
 
     async def execute(self, command: Command) -> CommandResponse:
         return CommandResponse(stdout="", stderr="", exit_code=0)
+
+    async def cancel_last(self) -> CancelResponse:
+        return CancelResponse(ok=True, message="dummy runtime: cancel_last noop")
 
     async def read_file(self, request: ReadFileRequest) -> ReadFileResponse:
         return ReadFileResponse()

@@ -1,4 +1,3 @@
-import asyncio
 import time
 from collections.abc import Callable
 
@@ -24,7 +23,7 @@ async def _wait_until_alive(
         await_response = await function(timeout=function_timeout)
         if await_response:
             return
-        await asyncio.sleep(sleep)
+        time.sleep(sleep)
         n_attempts += 1
     last_response_message = await_response.message if await_response else None
     msg = (

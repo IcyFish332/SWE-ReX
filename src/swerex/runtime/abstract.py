@@ -140,6 +140,11 @@ CloseSessionResponse = Annotated[CloseBashSessionResponse, Field(discriminator="
 """Union type for all close session responses. Do not use this directly."""
 
 
+class CancelResponse(BaseModel):
+    ok: bool = False
+    message: str = ""
+
+
 class Command(BaseModel):
     """A command to run as a subprocess."""
 
@@ -265,6 +270,11 @@ class AbstractRuntime(ABC):
     @abstractmethod
     async def execute(self, command: Command) -> CommandResponse:
         """Executes a command (in a sub-shell, similar to `subprocess.run()`)."""
+        pass
+
+    @abstractmethod
+    async def cancel_last(self) -> CancelResponse:
+        """Attempts to cancel the most recent command."""
         pass
 
     @abstractmethod

@@ -169,6 +169,13 @@ class RemoteDeploymentConfig(BaseModel):
     port: int | None = None
     """The port to connect to."""
     timeout: float = 0.15
+    """Default timeout (seconds) for runtime requests."""
+    upload_num_retries: int = 3
+    """Number of retries for upload requests."""
+    upload_retry_delay: float = 0.5
+    """Initial retry delay (seconds) for upload exponential backoff."""
+    upload_backoff_max: float = 5.0
+    """Maximum delay (seconds) for upload exponential backoff."""
 
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
@@ -211,6 +218,77 @@ class DaytonaDeploymentConfig(BaseModel):
         return DaytonaDeployment.from_config(self)
 
 
+class K8sDeploymentConfig(BaseModel):
+    """Configuration for Kubernetes deployment."""
+
+    image: str = "python:3.11"
+    """Container image to use for the pod."""
+    
+    namespace: str = "default"
+    """Kubernetes namespace to use."""
+    
+    port: int | None = None
+    """Local port for port-forwarding. If None, a free port is found."""
+    
+    startup_timeout: float = 180.0
+    """The time to wait for the runtime to start."""
+
+    runtime_timeout: float = 60.0
+    """Runtime timeout (default timeout for all runtime requests)."""
+    upload_num_retries: int = 3
+    """Number of retries for upload requests."""
+    upload_retry_delay: float = 0.5
+    """Initial retry delay (seconds) for upload exponential backoff."""
+    upload_backoff_max: float = 5.0
+    """Maximum delay (seconds) for upload exponential backoff."""
+
+    close_timeout: float | None = 300.0
+    """Timeout for runtime close during shutdown. None disables the timeout."""
+    
+    resource_requests: dict[str, str] = {
+        "memory": "4Gi",
+        "cpu": "2",
+    }
+    """Resource requests for the pod."""
+    
+    resource_limits: dict[str, str] = {
+        "memory": "4Gi",
+        "cpu": "2",
+    }
+    """Resource limits for the pod."""
+    
+    exec_shell: list[str] = ["/bin/sh", "-c"]
+    """The shell executable and arguments to use for running commands."""
+
+    use_acr: bool = True
+    """Whether to map SWE-bench images to ACR (Alibaba Container Registry) format."""
+
+    pypi_index_url: str | None = None
+    """Custom PyPI simple index URL to use for installing dependencies (e.g., pipx or swe-rex via pipx)."""
+
+    pypi_trusted_hosts: list[str] = []
+    """Optional list of hosts to trust for PyPI requests (passed to pip as --trusted-host and via PIP_TRUSTED_HOST)."""
+
+    apt_source_url: str | None = None
+    """Custom APT source URL to use for Ubuntu/Debian package installations (e.g., Aliyun mirror for China regions)."""
+
+    active_deadline_seconds: int | None = None
+    """Optional overall time limit for the pod. If set, Kubernetes will terminate the pod after this many seconds."""
+
+    type: Literal["k8s"] = "k8s"
+    """Discriminator for (de)serialization/CLI. Do not change."""
+
+    python_standalone_dir: str | None = None
+    """The directory to use for the python standalone."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    def get_deployment(self) -> AbstractDeployment:
+        from swerex.deployment.k8s import K8sDeployment
+
+        return K8sDeployment.from_config(self)
+
+
 DeploymentConfig = (
     LocalDeploymentConfig
     | DockerDeploymentConfig
@@ -219,6 +297,7 @@ DeploymentConfig = (
     | RemoteDeploymentConfig
     | DummyDeploymentConfig
     | DaytonaDeploymentConfig
+    | K8sDeploymentConfig
 )
 """Union of all deployment configurations. Useful for type hints."""
 

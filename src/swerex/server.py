@@ -15,6 +15,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
 
 from swerex import __version__
+from swerex.utils.temp import get_repo_temp_dir
 from swerex.runtime.abstract import (
     Action,
     CloseResponse,
@@ -149,6 +150,11 @@ async def execute(command: Command):
     return serialize_model(await runtime.execute(command))
 
 
+@app.post("/cancel_last")
+async def cancel_last():
+    return serialize_model(await runtime.cancel_last())
+
+
 @app.post("/read_file")
 async def read_file(request: ReadFileRequest):
     return serialize_model(await runtime.read_file(request))
@@ -168,7 +174,8 @@ async def upload(
     target_path: Path = Path(target_path)
     target_path.parent.mkdir(parents=True, exist_ok=True)
     # First save the file to a temporary directory and potentially unzip it.
-    with tempfile.TemporaryDirectory() as temp_dir:
+    temp_dir_root = get_repo_temp_dir()
+    with tempfile.TemporaryDirectory(dir=temp_dir_root) as temp_dir:
         file_path = Path(temp_dir) / "temp_file_transfer"
         try:
             with open(file_path, "wb") as f:

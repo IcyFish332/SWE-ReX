@@ -3,7 +3,9 @@ import logging
 import os
 import re
 import shutil
+import signal
 import subprocess
+import threading
 import time
 from abc import ABC, abstractmethod
 from copy import deepcopy
@@ -35,6 +37,7 @@ from swerex.runtime.abstract import (
     CloseResponse,
     CloseSessionRequest,
     CloseSessionResponse,
+    CancelResponse,
     Command,
     CommandResponse,
     CreateBashSessionRequest,
@@ -56,12 +59,12 @@ from swerex.utils.log import get_logger
 __all__ = ["LocalRuntime", "BashSession"]
 
 
-def _split_bash_command(input: str) -> list[str]:
+def _split_bash_command(inpt: str) -> list[str]:
     r"""Split a bash command with linebreaks, escaped newlines, and heredocs into a list of
     individual commands.
 
     Args:
-        input: The input string to split into commands.
+        inpt: The input string to split into commands.
     Returns:
         A list of commands as strings.
 
@@ -71,11 +74,11 @@ def _split_bash_command(input: str) -> list[str]:
     "cmd1\\\n asdf" is one command (because the linebreak is escaped)
     "cmd1<<EOF\na\nb\nEOF" is one command (because of the heredoc)
     """
-    input = input.strip()
-    if not input or all(l.strip().startswith("#") for l in input.splitlines()):
+    inpt = inpt.strip()
+    if not inpt or all(l.strip().startswith("#") for l in inpt.splitlines()):
         # bashlex can't deal with empty strings or the like :/
         return []
-    parsed = bashlex.parse(input)
+    parsed = bashlex.parse(inpt)
     cmd_strings = []
 
     def find_range(cmd: bashlex.ast.node) -> tuple[int, int]:
@@ -89,7 +92,7 @@ def _split_bash_command(input: str) -> list[str]:
 
     for cmd in parsed:
         start, end = find_range(cmd)
-        cmd_strings.append(input[start:end])
+        cmd_strings.append(inpt[start:end])
     return cmd_strings
 
 
@@ -163,7 +166,7 @@ class BashSession(Session):
             echo=False,
             env=dict(os.environ.copy(), **{"PS1": self._ps1, "PS2": "", "PS0": ""}),  # type: ignore
         )
-        await asyncio.sleep(0.3)
+        time.sleep(0.3)
         cmds = []
         if self.request.startup_source:
             cmds += [f"source {path}" for path in self.request.startup_source] + ["sleep 0.3"]
@@ -193,7 +196,7 @@ class BashSession(Session):
                 expect_index = self.shell.expect(expect_strings, timeout=action.timeout)  # type: ignore
                 matched_expect_string = expect_strings[expect_index]
             except Exception:
-                await asyncio.sleep(0.2)
+                time.sleep(0.2)
                 continue
             output += _strip_control_chars(self.shell.before)  # type: ignore
             output += self._eat_following_output()
@@ -323,7 +326,8 @@ class BashSession(Session):
         try:
             _exit_code_prefix = "EXITCODESTART"
             _exit_code_suffix = "EXITCODEEND"
-            self.shell.sendline(f"\necho {_exit_code_prefix}$?{_exit_code_suffix}")
+            # Use printf without a trailing newline to minimize stray output
+            self.shell.sendline(f'\nprintf "{_exit_code_prefix}%s{_exit_code_suffix}" $?')
             try:
                 self.shell.expect(_exit_code_suffix, timeout=1)
             except pexpect.TIMEOUT:
@@ -342,7 +346,15 @@ class BashSession(Session):
             except pexpect.TIMEOUT:
                 msg = "Timeout while getting PS1 after exit code extraction"
                 raise CommandTimeoutError(msg)
-            output = output.replace(self._UNIQUE_STRING, "").replace(self._ps1, "")
+            # Drain any residual bytes that might include the exit-code probe
+            _ = self._eat_following_output(0.05)
+            # # Extra hardening: ensure markers never leak even if upstream reads wrong buffer
+            # output = (
+            #     output.replace(self._UNIQUE_STRING, "")
+            #     .replace(self._ps1, "")
+            #     .replace(_exit_code_prefix, "")
+            #     .replace(_exit_code_suffix, "")
+            # )
         except Exception:
             # Ignore all exceptions if check == 'silent'
             if action.check == "raise":
@@ -374,6 +386,10 @@ class LocalRuntime(AbstractRuntime):
         self._config = LocalRuntimeConfig(**kwargs)
         self._sessions: dict[str, Session] = {}
         self.logger = logger or get_logger("rex-runtime")
+        self._last_cmd_pid_path = Path(
+            os.getenv("SWEREX_LAST_CMD_PID_PATH", "/tmp/swerex_last_cmd.pid")
+        )
+        self._last_cmd_lock = threading.Lock()
 
     @classmethod
     def from_config(cls, config: LocalRuntimeConfig) -> Self:
@@ -423,34 +439,106 @@ class LocalRuntime(AbstractRuntime):
             CommandTimeoutError: If the command times out.
             NonZeroExitCodeError: If the command has a non-zero exit code and `check` is True.
         """
+        return await asyncio.to_thread(self._execute_blocking, command)
+
+    def _execute_blocking(self, command: Command) -> CommandResponse:
+        stdout_target = subprocess.PIPE
+        stderr_target = subprocess.STDOUT if command.merge_output_streams else subprocess.PIPE
+        preexec_fn = os.setsid if hasattr(os, "setsid") else None
         try:
-            result = subprocess.run(
+            proc = subprocess.Popen(
                 command.command,
                 shell=command.shell,
-                timeout=command.timeout,
                 env=command.env,
-                stdin=subprocess.DEVNULL,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT if command.merge_output_streams else subprocess.PIPE,
+                stdout=stdout_target,
+                stderr=stderr_target,
                 cwd=command.cwd,
+                preexec_fn=preexec_fn,
             )
-            r = CommandResponse(
-                stdout=result.stdout.decode(errors="backslashreplace"),
-                stderr=result.stderr.decode(errors="backslashreplace") if result.stderr is not None else "",
-                exit_code=result.returncode,
-            )
+        except FileNotFoundError as e:
+            stderr_text = str(e)
+            if command.cwd:
+                stderr_text = f"{stderr_text} (cwd={command.cwd})"
+            return CommandResponse(stdout="", stderr=stderr_text, exit_code=2)
+
+        pgid: int | None = None
+        try:
+            pgid = os.getpgid(proc.pid)
+        except Exception:
+            pgid = proc.pid
+
+        with self._last_cmd_lock:
+            try:
+                self._last_cmd_pid_path.parent.mkdir(parents=True, exist_ok=True)
+                self._last_cmd_pid_path.write_text(str(pgid))
+            except Exception:
+                pass
+
+        try:
+            out, err = proc.communicate(timeout=command.timeout)
         except subprocess.TimeoutExpired as e:
+            if pgid is not None:
+                try:
+                    if hasattr(os, "killpg"):
+                        os.killpg(pgid, signal.SIGKILL)
+                    else:
+                        os.kill(pgid, signal.SIGKILL)
+                except Exception:
+                    pass
             msg = f"Timeout ({command.timeout}s) exceeded while running command"
             raise CommandTimeoutError(msg) from e
-        if command.check and result.returncode != 0:
+        finally:
+            with self._last_cmd_lock:
+                try:
+                    if self._last_cmd_pid_path.exists():
+                        self._last_cmd_pid_path.unlink()
+                except Exception:
+                    pass
+
+        stdout_text = out.decode(errors="backslashreplace") if out else ""
+        stderr_text = err.decode(errors="backslashreplace") if err else ""
+        r = CommandResponse(
+            stdout=stdout_text,
+            stderr=stderr_text,
+            exit_code=proc.returncode,
+        )
+        if command.check and proc.returncode != 0:
             msg = (
-                f"Command {command.command!r} failed with exit code {result.returncode}. "
+                f"Command {command.command!r} failed with exit code {proc.returncode}. "
                 f"Stdout:\n{r.stdout!r}\nStderr:\n{r.stderr!r}"
             )
             if command.error_msg:
                 msg = f"{command.error_msg}: {msg}"
             raise NonZeroExitCodeError(msg)
         return r
+
+    async def cancel_last(self) -> CancelResponse:
+        return await asyncio.to_thread(self._cancel_last_blocking)
+
+    def _cancel_last_blocking(self) -> CancelResponse:
+        with self._last_cmd_lock:
+            try:
+                if not self._last_cmd_pid_path.exists():
+                    return CancelResponse(ok=False, message="no running command to cancel")
+                pid_raw = self._last_cmd_pid_path.read_text().strip()
+            except Exception as e:
+                return CancelResponse(ok=False, message=str(e))
+        if not pid_raw:
+            return CancelResponse(ok=False, message="no running command to cancel")
+        try:
+            pid = int(pid_raw)
+        except ValueError:
+            return CancelResponse(ok=False, message=f"invalid pid value: {pid_raw!r}")
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(pid, signal.SIGKILL)
+            else:
+                os.kill(pid, signal.SIGKILL)
+            return CancelResponse(ok=True, message=f"sent SIGKILL to process group {pid}")
+        except ProcessLookupError:
+            return CancelResponse(ok=False, message=f"process group {pid} not found")
+        except Exception as e:
+            return CancelResponse(ok=False, message=str(e))
 
     async def read_file(self, request: ReadFileRequest) -> ReadFileResponse:
         """Reads a file"""

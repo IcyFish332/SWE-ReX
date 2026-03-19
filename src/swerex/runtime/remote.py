@@ -1,4 +1,7 @@
 import asyncio
+
+asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
+
 import logging
 import random
 import shutil
@@ -20,6 +23,7 @@ from swerex.runtime.abstract import (
     CloseResponse,
     CloseSessionRequest,
     CloseSessionResponse,
+    CancelResponse,
     Command,
     CommandResponse,
     CreateSessionRequest,
@@ -36,6 +40,7 @@ from swerex.runtime.abstract import (
 )
 from swerex.runtime.config import RemoteRuntimeConfig
 from swerex.utils.log import get_logger
+from swerex.utils.temp import get_repo_temp_dir
 from swerex.utils.wait import _wait_until_alive
 
 __all__ = ["RemoteRuntime", "RemoteRuntimeConfig"]
@@ -176,11 +181,13 @@ class RemoteRuntime(AbstractRuntime):
 
         while retry_count <= num_retries:
             try:
+                timeout_value = self._get_timeout(None)
                 async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
                     async with session.post(
                         request_url,
                         json=payload.model_dump() if payload else None,
                         headers=headers,
+                        timeout=aiohttp.ClientTimeout(total=timeout_value),
                     ) as resp:
                         await self._handle_response_errors(resp)
                         return output_class(**await resp.json())
@@ -202,7 +209,7 @@ class RemoteRuntime(AbstractRuntime):
 
     async def run_in_session(self, action: Action) -> Observation:
         """Runs a command in a session."""
-        return await self._request("run_in_session", action, Observation)
+        return await self._request("run_in_session", action, Observation, num_retries=3)
 
     async def close_session(self, request: CloseSessionRequest) -> CloseSessionResponse:
         """Closes a shell session."""
@@ -211,6 +218,10 @@ class RemoteRuntime(AbstractRuntime):
     async def execute(self, command: Command) -> CommandResponse:
         """Executes a command (independent of any shell session)."""
         return await self._request("execute", command, CommandResponse)
+
+    async def cancel_last(self) -> CancelResponse:
+        """Attempts to cancel the most recent command."""
+        return await self._request("cancel_last", None, CancelResponse)
 
     async def read_file(self, request: ReadFileRequest) -> ReadFileResponse:
         """Reads a file"""
@@ -226,36 +237,82 @@ class RemoteRuntime(AbstractRuntime):
         self.logger.debug("Uploading file from %s to %s", request.source_path, request.target_path)
 
         async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+            num_retries = self._config.upload_num_retries
+            retry_delay = self._config.upload_retry_delay
+            backoff_max = self._config.upload_backoff_max
+            timeout_value = self._get_timeout(None)
+
             if source.is_dir():
                 # Ignore cleanup errors: See https://github.com/SWE-agent/SWE-agent/issues/1005
-                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as temp_dir:
+                temp_dir_root = get_repo_temp_dir()
+                with tempfile.TemporaryDirectory(ignore_cleanup_errors=True, dir=temp_dir_root) as temp_dir:
                     zip_path = Path(temp_dir) / "zipped_transfer.zip"
                     shutil.make_archive(str(zip_path.with_suffix("")), "zip", source)
                     self.logger.debug("Created zip file at %s", zip_path)
 
-                    with open(zip_path, "rb") as f:
-                        data = aiohttp.FormData()
-                        data.add_field("file", f, filename=zip_path.name, content_type="application/zip")
-                        data.add_field("target_path", request.target_path)
-                        data.add_field("unzip", "true")
+                    for attempt in range(num_retries + 1):
+                        try:
+                            with open(zip_path, "rb") as f:
+                                data = aiohttp.FormData()
+                                data.add_field("file", f, filename=zip_path.name, content_type="application/zip")
+                                data.add_field("target_path", request.target_path)
+                                data.add_field("unzip", "true")
 
-                        async with session.post(
-                            f"{self._api_url}/upload", data=data, headers=self._headers
-                        ) as response:
-                            await self._handle_response_errors(response)
-                            return UploadResponse(**(await response.json()))
+                                async with session.post(
+                                    f"{self._api_url}/upload",
+                                    data=data,
+                                    headers=self._headers,
+                                    timeout=aiohttp.ClientTimeout(total=timeout_value),
+                                ) as response:
+                                    await self._handle_response_errors(response)
+                                    return UploadResponse(**(await response.json()))
+                        except Exception as e:
+                            if attempt < num_retries:
+                                self.logger.warning(
+                                    "Upload retry in %.2fs (%d/%d): %s",
+                                    retry_delay,
+                                    attempt + 1,
+                                    num_retries,
+                                    e,
+                                )
+                                await asyncio.sleep(retry_delay)
+                                retry_delay = min(retry_delay * 2 + random.uniform(0, 0.5), backoff_max)
+                                continue
+                            self.logger.error("Upload failed after %d retries: %s", num_retries, e)
+                            raise
             elif source.is_file():
                 self.logger.debug("Uploading file from %s to %s", source, request.target_path)
 
-                with open(source, "rb") as f:
-                    data = aiohttp.FormData()
-                    data.add_field("file", f, filename=source.name)
-                    data.add_field("target_path", request.target_path)
-                    data.add_field("unzip", "false")
+                for attempt in range(num_retries + 1):
+                    try:
+                        with open(source, "rb") as f:
+                            data = aiohttp.FormData()
+                            data.add_field("file", f, filename=source.name)
+                            data.add_field("target_path", request.target_path)
+                            data.add_field("unzip", "false")
 
-                    async with session.post(f"{self._api_url}/upload", data=data, headers=self._headers) as response:
-                        await self._handle_response_errors(response)
-                        return UploadResponse(**(await response.json()))
+                            async with session.post(
+                                f"{self._api_url}/upload",
+                                data=data,
+                                headers=self._headers,
+                                timeout=aiohttp.ClientTimeout(total=timeout_value),
+                            ) as response:
+                                await self._handle_response_errors(response)
+                                return UploadResponse(**(await response.json()))
+                    except Exception as e:
+                        if attempt < num_retries:
+                            self.logger.warning(
+                                "Upload retry in %.2fs (%d/%d): %s",
+                                retry_delay,
+                                attempt + 1,
+                                num_retries,
+                                e,
+                            )
+                            await asyncio.sleep(retry_delay)
+                            retry_delay = min(retry_delay * 2 + random.uniform(0, 0.5), backoff_max)
+                            continue
+                        self.logger.error("Upload failed after %d retries: %s", num_retries, e)
+                        raise
             else:
                 msg = f"Source path {source} is not a file or directory"
                 raise ValueError(msg)

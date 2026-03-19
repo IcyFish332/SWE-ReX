@@ -64,6 +64,9 @@ class RemoteDeployment(AbstractDeployment):
             host=self._config.host,
             port=self._config.port,
             timeout=self._config.timeout,
+            upload_num_retries=self._config.upload_num_retries,
+            upload_retry_delay=self._config.upload_retry_delay,
+            upload_backoff_max=self._config.upload_backoff_max,
             logger=self.logger,
         )
 

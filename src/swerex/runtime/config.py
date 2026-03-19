@@ -28,6 +28,12 @@ class RemoteRuntimeConfig(BaseModel):
     """The port to connect to."""
     timeout: float = 0.15
     """The timeout for the runtime."""
+    upload_num_retries: int = 3
+    """Number of retries for upload requests."""
+    upload_retry_delay: float = 0.5
+    """Initial retry delay (seconds) for upload exponential backoff."""
+    upload_backoff_max: float = 5.0
+    """Maximum delay (seconds) for upload exponential backoff."""
 
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
