@@ -2,8 +2,9 @@ import asyncio
 
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
+import json
 import logging
-import subprocess
+import os
 import time
 import socket
 import uuid
@@ -27,7 +28,7 @@ from swerex.utils.wait import _wait_until_alive
 __all__ = ["K8sDeployment", "K8sDeploymentConfig"]
 
 # ACR (Alibaba Container Registry) configuration for SWE-bench images
-ACR_REGISTRY = "sii-wulan-registry-vpc.cn-wulanchabu.cr.aliyuncs.com"
+ACR_REGISTRY = os.getenv("SWE_ACR_REGISTRY", "sii-wulan-registry-vpc.cn-wulanchabu.cr.aliyuncs.com")
 ACR_NAMESPACE = "sii-wulan/dockerhub-mirror"
 # Tag mapping follows SWE-scripts/batch_upload.py convert_to_acr_tag
 
@@ -57,7 +58,7 @@ def map_image_to_acr(image: str) -> str:
     if len(segments) > 1 and ('.' in segments[0] or ':' in segments[0] or segments[0] == 'localhost'):
         image_part = "/".join(segments[1:])
     if "latest" not in image:
-        acr_tag = image_part.replace("/", "--") 
+        acr_tag = image_part.replace("/", "--")
     # Replace "/" with "--" to flatten into a single repo tag
     else:
         acr_tag = image_part.replace("/", "--") + f"--{tag}"
@@ -72,6 +73,23 @@ def map_image_to_acr_swefactory(image: str) -> str:
 
     return acr_image
 
+
+async def _async_kubectl(*args: str, timeout: float = 30) -> tuple[int, str, str]:
+    """Run a kubectl command asynchronously.
+
+    Returns:
+        Tuple of (returncode, stdout, stderr).
+    """
+    proc = await asyncio.create_subprocess_exec(
+        "kubectl", *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    stdout_bytes, stderr_bytes = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    stdout = stdout_bytes.decode() if stdout_bytes else ""
+    stderr = stderr_bytes.decode() if stderr_bytes else ""
+    assert proc.returncode is not None
+    return proc.returncode, stdout, stderr
 
 
 class K8sDeployment(AbstractDeployment):
@@ -93,6 +111,15 @@ class K8sDeployment(AbstractDeployment):
         self.logger = logger or get_logger("rex-deploy-k8s")
         self._runtime_timeout = self._config.runtime_timeout
         self._hooks = CombinedDeploymentHook()
+        self._pod_create_start: float | None = None
+        self._pod_ready_time: float | None = None
+
+    @property
+    def pod_startup_duration(self) -> float | None:
+        """Wall-clock seconds from pod creation request to pod Ready condition."""
+        if self._pod_create_start is not None and self._pod_ready_time is not None:
+            return self._pod_ready_time - self._pod_create_start
+        return None
 
     def add_hook(self, hook: DeploymentHook):
         self._hooks.add_hook(hook)
@@ -149,28 +176,26 @@ class K8sDeployment(AbstractDeployment):
         if self._pod_name is None:
             msg = "Pod not started"
             raise DeploymentNotStartedError(msg)
-        
+
         # Check if pod is still running
         try:
-            subprocess.check_call(
-                ["kubectl", "get", "pod", self._pod_name, f"--namespace={self._config.namespace}"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
+            returncode, _, _ = await _async_kubectl(
+                "get", "pod", self._pod_name, f"--namespace={self._config.namespace}",
                 timeout=30,
             )
-        except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+            if returncode != 0:
+                msg = f"Pod {self._pod_name} is not running"
+                raise RuntimeError(msg)
+        except (asyncio.TimeoutError, TimeoutError):
             msg = f"Pod {self._pod_name} is not running"
             raise RuntimeError(msg)
-        
-        result = subprocess.run(
-            ["kubectl", "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json"],
-            capture_output=True,
-            text=True,
+
+        returncode, stdout, stderr = await _async_kubectl(
+            "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json",
             timeout=30,
         )
-        if result.returncode == 0:
-            import json
-            pod_json = json.loads(result.stdout)
+        if returncode == 0:
+            pod_json = json.loads(stdout)
             status = pod_json.get("status", {})
             conditions = status.get("conditions", [])
             not_ready = any(c.get("reason","") == "PodFailed" and c.get("status") == "False" for c in conditions)
@@ -185,13 +210,11 @@ class K8sDeployment(AbstractDeployment):
         except TimeoutError as e:
             # self.logger.error("Runtime did not start within timeout. Checking pod logs...")
             try:
-                result = subprocess.run(
-                    ["kubectl", "logs", self._pod_name, f"--namespace={self._config.namespace}"],
-                    capture_output=True,
-                    text=True,
+                await _async_kubectl(
+                    "logs", self._pod_name, f"--namespace={self._config.namespace}",
                     timeout=30,
                 )
-                # self.logger.error(f"Pod logs:\n{result.stdout}\n{result.stderr}")
+                # self.logger.error(f"Pod logs:\n{stdout}\n{stderr}")
             except Exception as log_error:
                 # self.logger.error(f"Failed to get pod logs: {log_error}")
                 pass
@@ -346,9 +369,8 @@ class K8sDeployment(AbstractDeployment):
             cmd,
         ]
 
-    def _create_pod(self, image: str) -> bool:
+    async def _create_pod(self, image: str) -> bool:
         """Create the Kubernetes pod."""
-        import json
         import tempfile
         from pathlib import Path
 
@@ -416,29 +438,22 @@ class K8sDeployment(AbstractDeployment):
         try:
             # Create pod
             # self.logger.info(f"Creating pod {self._pod_name} with image {self._config.image}")
-            result = subprocess.run(
-                ["kubectl", "apply", "-f", yaml_path],
-                capture_output=True,
-                text=True,
-                timeout=30,
-            )
-            if result.returncode != 0:
-                # self.logger.error(f"Failed to create pod: {result.stderr}")
+            self._pod_create_start = time.time()
+            returncode, stdout, stderr = await _async_kubectl("apply", "-f", yaml_path, timeout=30)
+            if returncode != 0:
+                # self.logger.error(f"Failed to create pod: {stderr}")
                 return False
 
             # Wait for pod to be ready
             # self.logger.info(f"Waiting for pod {self._pod_name} to be ready...")
             deadline = time.time() + self._config.startup_timeout
             while time.time() < deadline:
-                result = subprocess.run(
-                    ["kubectl", "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json"],
-                    capture_output=True,
-                    text=True,
+                returncode, stdout, stderr = await _async_kubectl(
+                    "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json",
                     timeout=10,
                 )
-                if result.returncode == 0:
-                    import json
-                    pod_json = json.loads(result.stdout)
+                if returncode == 0:
+                    pod_json = json.loads(stdout)
                     status = pod_json.get("status", {})
                     conditions = status.get("conditions", [])
                     ready = any(c.get("type") == "Ready" and c.get("status") == "True" for c in conditions)
@@ -448,9 +463,10 @@ class K8sDeployment(AbstractDeployment):
                         return False
                     if ready:
                         self._pod_ip = status.get("podIP")
+                        self._pod_ready_time = time.time()
                         # self.logger.info(f"Pod {self._pod_name} is ready with IP {self._pod_ip}")
                         return True
-                time.sleep(2)
+                await asyncio.sleep(2)
 
             # self.logger.error(f"Pod {self._pod_name} did not become ready within timeout")
             return False
@@ -466,7 +482,7 @@ class K8sDeployment(AbstractDeployment):
 
         # Determine image to use
         image = self._config.image
-        
+
         # Map to ACR if it's a SWE-bench image
         if self._config.use_acr and ("swebench" in image.lower() or "sweb.eval" in image):
             image = map_image_to_acr(image)
@@ -481,7 +497,7 @@ class K8sDeployment(AbstractDeployment):
 
         # Create pod
         self._hooks.on_custom_step("Creating Kubernetes pod")
-        if not self._create_pod(image):
+        if not await self._create_pod(image):
             msg = f"Failed to create pod {self._pod_name}"
             raise RuntimeError(msg)
 
@@ -489,15 +505,12 @@ class K8sDeployment(AbstractDeployment):
         self._hooks.on_custom_step("Resolving pod IP")
         if not self._pod_ip:
             try:
-                result = subprocess.run(
-                    ["kubectl", "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json"],
-                    capture_output=True,
-                    text=True,
+                returncode, stdout, stderr = await _async_kubectl(
+                    "get", "pod", self._pod_name, f"--namespace={self._config.namespace}", "-o", "json",
                     timeout=30,
                 )
-                if result.returncode == 0:
-                    import json
-                    pod_json = json.loads(result.stdout)
+                if returncode == 0:
+                    pod_json = json.loads(stdout)
                     self._pod_ip = pod_json.get("status", {}).get("podIP")
             except Exception as e:
                 # self.logger.warning(f"Failed to fetch pod IP: {e}")
@@ -506,7 +519,7 @@ class K8sDeployment(AbstractDeployment):
             await self.stop()
             msg = f"Failed to determine IP for pod {self._pod_name}"
             raise RuntimeError(msg)
-        
+
         # Connect to runtime directly via Pod IP:8000
         self._hooks.on_custom_step("Starting runtime")
         target_host = f"http://{self._pod_ip}"
@@ -548,34 +561,22 @@ class K8sDeployment(AbstractDeployment):
             try:
                 # self.logger.info(f"Deleting pod {self._pod_name}")
                 # t0 = time.time()
-                result = subprocess.run(
-                    [
-                        "kubectl",
-                        "delete",
-                        "pod",
-                        self._pod_name,
-                        f"--namespace={self._config.namespace}",
-                        "--force",
-                        "--grace-period=0",
-                        "--wait=false",
-                        "--request-timeout=10s",
-                    ],
-                    capture_output=True,
+                await _async_kubectl(
+                    "delete",
+                    "pod",
+                    self._pod_name,
+                    f"--namespace={self._config.namespace}",
+                    "--force",
+                    "--grace-period=0",
+                    "--wait=false",
+                    "--request-timeout=10s",
                     timeout=15,
-                    check=False,
                 )
                 # elapsed = time.time() - t0
-                # stdout = (result.stdout or "").strip()
-                # stderr = (result.stderr or "").strip()
                 # self.logger.info(
-                #     "kubectl delete pod finished in %.2fs (returncode=%s)",
+                #     "kubectl delete pod finished in %.2fs",
                 #     elapsed,
-                #     result.returncode,
                 # )
-                # if stdout:
-                #     self.logger.info("kubectl delete pod stdout: %s", stdout)
-                # if stderr:
-                #     self.logger.warning("kubectl delete pod stderr: %s", stderr)
             except Exception as e:
                 # self.logger.warning(f"Failed to delete pod {self._pod_name}: {e}")
                 pass
