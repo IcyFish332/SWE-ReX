@@ -27,9 +27,10 @@ from swerex.utils.wait import _wait_until_alive
 
 __all__ = ["K8sDeployment", "K8sDeploymentConfig"]
 
-# ACR (Alibaba Container Registry) configuration for SWE-bench images
-ACR_REGISTRY = os.getenv("SWE_ACR_REGISTRY", "sii-wulan-registry-vpc.cn-wulanchabu.cr.aliyuncs.com")
-ACR_NAMESPACE = "sii-wulan/dockerhub-mirror"
+# ACR (Alibaba Container Registry) configuration for SWE-bench images.
+# Set SWE_ACR_REGISTRY and SWE_ACR_NAMESPACE via environment variables.
+ACR_REGISTRY = os.getenv("SWE_ACR_REGISTRY", "")
+ACR_NAMESPACE = os.getenv("SWE_ACR_NAMESPACE", "")
 # Tag mapping follows SWE-scripts/batch_upload.py convert_to_acr_tag
 
 
@@ -69,7 +70,7 @@ def map_image_to_acr_swefactory(image: str) -> str:
     Map a swefactory image name to ACR format.
     """
     # Remove namespace prefix if present
-    acr_image = f"{ACR_REGISTRY}/sii-wulan/swe-factory:{image.lower()}"
+    acr_image = f"{ACR_REGISTRY}/{os.getenv('SWE_ACR_SWEFACTORY_NAMESPACE', ACR_NAMESPACE)}:{image.lower()}"
 
     return acr_image
 
