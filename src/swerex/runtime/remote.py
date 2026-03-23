@@ -3,6 +3,7 @@ import asyncio
 asyncio.set_event_loop_policy(asyncio.DefaultEventLoopPolicy())
 
 import logging
+import os
 import random
 import shutil
 import sys
@@ -60,6 +61,8 @@ class RemoteRuntime(AbstractRuntime):
         """
         self._config = RemoteRuntimeConfig(**kwargs)
         self.logger = logger or get_logger("rex-runtime")
+        self._proxy_url = os.environ.get("SWERL_K8S_PROXY")
+        self._proxy = None  # not used for socks5; kept for non-socks fallback
         if not self._config.host.startswith("http"):
             self.logger.warning("Host %s does not start with http, adding http://", self._config.host)
             self._config.host = f"http://{self._config.host}"
@@ -72,6 +75,13 @@ class RemoteRuntime(AbstractRuntime):
         if timeout is None:
             return self._config.timeout
         return timeout
+
+    def _make_connector(self) -> aiohttp.BaseConnector:
+        """Create an aiohttp connector, using socks5 proxy if configured."""
+        if self._proxy_url and self._proxy_url.startswith("socks"):
+            from aiohttp_socks import ProxyConnector
+            return ProxyConnector.from_url(self._proxy_url, rdns=True)
+        return aiohttp.TCPConnector(force_close=True)
 
     @property
     def _headers(self) -> dict[str, str]:
@@ -137,7 +147,7 @@ class RemoteRuntime(AbstractRuntime):
         together with the message.
         """
         try:
-            async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+            async with aiohttp.ClientSession(connector=self._make_connector()) as session:
                 timeout_value = self._get_timeout(timeout)
                 async with session.get(
                     f"{self._api_url}/is_alive",
@@ -182,13 +192,13 @@ class RemoteRuntime(AbstractRuntime):
         while retry_count <= num_retries:
             try:
                 timeout_value = self._get_timeout(None)
-                async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+                async with aiohttp.ClientSession(connector=self._make_connector()) as session:
                     async with session.post(
                         request_url,
                         json=payload.model_dump() if payload else None,
                         headers=headers,
                         timeout=aiohttp.ClientTimeout(total=timeout_value),
-                    ) as resp:
+                        ) as resp:
                         await self._handle_response_errors(resp)
                         return output_class(**await resp.json())
             except Exception as e:
@@ -236,7 +246,7 @@ class RemoteRuntime(AbstractRuntime):
         source = Path(request.source_path).resolve()
         self.logger.debug("Uploading file from %s to %s", request.source_path, request.target_path)
 
-        async with aiohttp.ClientSession(connector=aiohttp.TCPConnector(force_close=True)) as session:
+        async with aiohttp.ClientSession(connector=self._make_connector()) as session:
             num_retries = self._config.upload_num_retries
             retry_delay = self._config.upload_retry_delay
             backoff_max = self._config.upload_backoff_max
@@ -263,7 +273,7 @@ class RemoteRuntime(AbstractRuntime):
                                     data=data,
                                     headers=self._headers,
                                     timeout=aiohttp.ClientTimeout(total=timeout_value),
-                                ) as response:
+                                                ) as response:
                                     await self._handle_response_errors(response)
                                     return UploadResponse(**(await response.json()))
                         except Exception as e:
@@ -296,7 +306,7 @@ class RemoteRuntime(AbstractRuntime):
                                 data=data,
                                 headers=self._headers,
                                 timeout=aiohttp.ClientTimeout(total=timeout_value),
-                            ) as response:
+                                        ) as response:
                                 await self._handle_response_errors(response)
                                 return UploadResponse(**(await response.json()))
                     except Exception as e:
