@@ -211,6 +211,99 @@ class DaytonaDeploymentConfig(BaseModel):
         return DaytonaDeployment.from_config(self)
 
 
+class InspireSandboxDeploymentConfig(BaseModel):
+    """Configuration for running inside Inspire Sandbox."""
+
+    template: str | None = None
+    """Sandbox template name or ID used when creating a new sandbox."""
+
+    sandbox_id: str | None = None
+    """Existing sandbox ID to connect to instead of creating a new sandbox."""
+
+    sandbox_timeout: int | None = 3600
+    """Sandbox lifetime in seconds when creating or reconnecting."""
+
+    startup_timeout: float = 180.0
+    """The time to wait for the SWE-ReX runtime to start."""
+
+    runtime_timeout: float = 60.0
+    """Default timeout for RemoteRuntime requests."""
+
+    swerex_port: int = 8000
+    """Port inside the sandbox used by the SWE-ReX server."""
+
+    secure: bool = True
+    """Whether to secure the Inspire sandbox controller API."""
+
+    allow_internet_access: bool = True
+    """Whether the sandbox can reach the public internet."""
+
+    allow_public_traffic: bool = True
+    """Whether the public sandbox host can be accessed without the platform traffic token."""
+
+    metadata: dict[str, str] = Field(default_factory=dict)
+    """Metadata attached to newly created sandboxes."""
+
+    envs: dict[str, str] = Field(default_factory=dict)
+    """Environment variables set when creating a new sandbox."""
+
+    bootstrap_envs: dict[str, str] = Field(default_factory=dict)
+    """Environment variables passed only to the SWE-ReX bootstrap command."""
+
+    bootstrap_user: str | None = "root"
+    """User used to execute the SWE-ReX bootstrap command inside the sandbox."""
+
+    api_key: str | None = None
+    """Override Inspire Sandbox API key. Falls back to SBX_API_KEY."""
+
+    api_url: str | None = None
+    """Override Inspire Sandbox API URL. Falls back to SBX_API_URL."""
+
+    request_timeout: float | None = None
+    """Optional request timeout passed to Inspire Sandbox SDK calls."""
+
+    verify_ssl: bool | None = None
+    """Optional SSL verification override for Inspire Sandbox SDK calls."""
+
+    headers: dict[str, str] = Field(default_factory=dict)
+    """Additional headers passed to Inspire Sandbox control-plane API calls."""
+
+    runtime_headers: dict[str, str] = Field(default_factory=dict)
+    """Additional headers passed to the SWE-ReX runtime endpoint."""
+
+    swerex_bin: str = "/opt/swerex/bin/swerex-remote"
+    """Preferred path to a preinstalled SWE-ReX server binary inside the sandbox."""
+
+    apt_source_url: str | None = None
+    """Optional Ubuntu/Debian mirror used when bootstrap needs apt-get."""
+
+    pypi_index_url: str | None = None
+    """Optional PyPI index URL used during SWE-ReX bootstrap installation."""
+
+    pypi_trusted_hosts: list[str] = Field(default_factory=list)
+    """Trusted hosts passed to pip and pipx during SWE-ReX bootstrap installation."""
+
+    stop_policy: Literal["kill", "keep"] = "kill"
+    """Whether stopping the deployment kills the sandbox or leaves it running."""
+
+    type: Literal["inspire_sandbox"] = "inspire_sandbox"
+    """Discriminator for (de)serialization/CLI. Do not change."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    @model_validator(mode="after")
+    def validate_target(self):
+        if bool(self.template) == bool(self.sandbox_id):
+            msg = "Specify exactly one of 'template' or 'sandbox_id'"
+            raise ValueError(msg)
+        return self
+
+    def get_deployment(self) -> AbstractDeployment:
+        from swerex.deployment.inspire_sandbox import InspireSandboxDeployment
+
+        return InspireSandboxDeployment.from_config(self)
+
+
 DeploymentConfig = (
     LocalDeploymentConfig
     | DockerDeploymentConfig
@@ -219,6 +312,7 @@ DeploymentConfig = (
     | RemoteDeploymentConfig
     | DummyDeploymentConfig
     | DaytonaDeploymentConfig
+    | InspireSandboxDeploymentConfig
 )
 """Union of all deployment configurations. Useful for type hints."""
 

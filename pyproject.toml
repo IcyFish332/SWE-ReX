@@ -68,6 +68,9 @@ daytona = [
     "daytona",
     "daytona-sdk >= 0.21",
 ]
+inspire = [
+    "inspire-sandbox>=0.0.10",
+]
 
 [tool.setuptools]
 include-package-data = true

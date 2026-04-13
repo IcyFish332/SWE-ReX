@@ -1,6 +1,6 @@
 from typing import Literal
 
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from swerex.runtime.abstract import AbstractRuntime
 
@@ -28,6 +28,8 @@ class RemoteRuntimeConfig(BaseModel):
     """The port to connect to."""
     timeout: float = 0.15
     """The timeout for the runtime."""
+    extra_headers: dict[str, str] = Field(default_factory=dict)
+    """Additional HTTP headers to include in every runtime request."""
 
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
