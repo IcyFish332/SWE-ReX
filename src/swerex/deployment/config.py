@@ -223,8 +223,12 @@ class InspireSandboxDeploymentConfig(BaseModel):
     sandbox_timeout: int | None = 3600
     """Sandbox lifetime in seconds when creating or reconnecting."""
 
-    startup_timeout: float = 180.0
-    """The time to wait for the SWE-ReX runtime to start."""
+    startup_timeout: float = 600.0
+    """The time to wait for the SWE-ReX runtime to start.
+
+    Bootstrap may need to install python3.11 via apt and swe-rex via pip,
+    which can take several minutes on the Inspire platform.
+    """
 
     runtime_timeout: float = 60.0
     """Default timeout for RemoteRuntime requests."""
@@ -274,14 +278,42 @@ class InspireSandboxDeploymentConfig(BaseModel):
     swerex_bin: str = "/opt/swerex/bin/swerex-remote"
     """Preferred path to a preinstalled SWE-ReX server binary inside the sandbox."""
 
-    apt_source_url: str | None = None
-    """Optional Ubuntu/Debian mirror used when bootstrap needs apt-get."""
+    apt_source_url: str | None = "http://nexus.sii.shaipower.online/repository/ubuntu/"
+    """Ubuntu/Debian mirror used when bootstrap needs apt-get.
 
-    pypi_index_url: str | None = None
-    """Optional PyPI index URL used during SWE-ReX bootstrap installation."""
+    Defaults to the Inspire-internal Nexus mirror, which is the only
+    apt source reliably reachable from inside Inspire sandboxes.
+    """
 
-    pypi_trusted_hosts: list[str] = Field(default_factory=list)
-    """Trusted hosts passed to pip and pipx during SWE-ReX bootstrap installation."""
+    pypi_index_url: str | None = "http://nexus.sii.shaipower.online/repository/pypi/simple"
+    """PyPI index URL used during SWE-ReX bootstrap installation.
+
+    Defaults to the Inspire-internal Nexus mirror.  External mirrors
+    (pypi.org, Aliyun, Tsinghua, etc.) are not reachable from sandboxes.
+    """
+
+    pypi_trusted_hosts: list[str] = Field(default_factory=lambda: ["nexus.sii.shaipower.online"])
+    """Trusted hosts passed to pip and pipx during SWE-ReX bootstrap installation.
+
+    The default Nexus mirror uses plain HTTP, so its hostname must be
+    listed as a trusted host.
+    """
+
+    close_timeout: float | None = 10.0
+    """Timeout in seconds for closing the RemoteRuntime connection during stop().
+
+    If None, waits indefinitely. Prevents stop() from blocking forever
+    when the runtime is unresponsive.
+    """
+
+    upload_num_retries: int = 0
+    """Number of retries for file uploads to the runtime. 0 means no retry."""
+
+    upload_retry_delay: float = 0.5
+    """Initial delay in seconds between upload retries."""
+
+    upload_backoff_max: float = 5.0
+    """Maximum delay in seconds between upload retries (exponential backoff cap)."""
 
     stop_policy: Literal["kill", "keep"] = "kill"
     """Whether stopping the deployment kills the sandbox or leaves it running."""
@@ -295,6 +327,12 @@ class InspireSandboxDeploymentConfig(BaseModel):
     def validate_target(self):
         if bool(self.template) == bool(self.sandbox_id):
             msg = "Specify exactly one of 'template' or 'sandbox_id'"
+            raise ValueError(msg)
+        if self.template and "/" in self.template:
+            msg = (
+                f"Template name must not contain '/': {self.template!r}. "
+                "The Inspire Sandbox API rejects template names with slashes."
+            )
             raise ValueError(msg)
         return self
 

@@ -222,7 +222,29 @@ class RemoteRuntime(AbstractRuntime):
         return await self._request("write_file", request, WriteFileResponse)
 
     async def upload(self, request: UploadRequest) -> UploadResponse:
-        """Uploads a file"""
+        """Uploads a file, with optional retry on failure."""
+        max_attempts = 1 + self._config.upload_num_retries
+        last_exc: Exception | None = None
+        for attempt in range(max_attempts):
+            try:
+                return await self._upload_once(request)
+            except Exception as e:
+                last_exc = e
+                if attempt + 1 >= max_attempts:
+                    break
+                delay = min(
+                    self._config.upload_retry_delay * (2 ** attempt),
+                    self._config.upload_backoff_max,
+                )
+                self.logger.warning(
+                    "Upload attempt %d/%d failed: %s. Retrying in %.1fs",
+                    attempt + 1, max_attempts, e, delay,
+                )
+                await asyncio.sleep(delay)
+        raise last_exc  # type: ignore[misc]
+
+    async def _upload_once(self, request: UploadRequest) -> UploadResponse:
+        """Single upload attempt."""
         source = Path(request.source_path).resolve()
         self.logger.debug("Uploading file from %s to %s", request.source_path, request.target_path)
 

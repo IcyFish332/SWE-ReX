@@ -31,6 +31,13 @@ class RemoteRuntimeConfig(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
     """Additional HTTP headers to include in every runtime request."""
 
+    upload_num_retries: int = 0
+    """Number of retries for upload requests. 0 means no retry."""
+    upload_retry_delay: float = 0.5
+    """Initial delay in seconds between upload retries."""
+    upload_backoff_max: float = 5.0
+    """Maximum delay in seconds between upload retries (exponential backoff cap)."""
+
     type: Literal["remote"] = "remote"
     """Discriminator for (de)serialization/CLI. Do not change."""
 

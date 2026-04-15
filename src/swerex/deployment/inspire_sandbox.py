@@ -1,3 +1,4 @@
+import asyncio
 import logging
 import shlex
 import time
@@ -277,6 +278,9 @@ class InspireSandboxDeployment(AbstractDeployment):
                 timeout=self._config.runtime_timeout,
                 auth_token=self._auth_token,
                 extra_headers=self._runtime_headers(),
+                upload_num_retries=self._config.upload_num_retries,
+                upload_retry_delay=self._config.upload_retry_delay,
+                upload_backoff_max=self._config.upload_backoff_max,
             )
         )
 
@@ -291,8 +295,11 @@ class InspireSandboxDeployment(AbstractDeployment):
     async def stop(self):
         if self._runtime is not None:
             try:
-                await self._runtime.close()
-            except Exception:
+                if self._config.close_timeout is None:
+                    await self._runtime.close()
+                else:
+                    await asyncio.wait_for(self._runtime.close(), timeout=self._config.close_timeout)
+            except (Exception, asyncio.TimeoutError):
                 self.logger.warning("Failed to close runtime cleanly", exc_info=False)
             finally:
                 self._runtime = None
