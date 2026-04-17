@@ -217,6 +217,19 @@ class InspireSandboxDeployment(AbstractDeployment):
         script = "\n".join(lines)
         return "bash -lc " + shlex.quote(script)
 
+    def _get_bootstrap_output(self) -> str:
+        """Read accumulated stdout/stderr from the bootstrap command handle."""
+        if self._command_handle is None:
+            return ""
+        stdout = getattr(self._command_handle, "_stdout", "") or ""
+        stderr = getattr(self._command_handle, "_stderr", "") or ""
+        parts = []
+        if stdout:
+            parts.append(f"stdout:\n{stdout}")
+        if stderr:
+            parts.append(f"stderr:\n{stderr}")
+        return "\n".join(parts)
+
     async def is_alive(self, *, timeout: float | None = None) -> IsAliveResponse:
         if self._runtime is None or self._sandbox is None:
             raise DeploymentNotStartedError()
@@ -225,6 +238,12 @@ class InspireSandboxDeployment(AbstractDeployment):
                 return IsAliveResponse(is_alive=False, message="Inspire sandbox is not running")
         except Exception as e:
             return IsAliveResponse(is_alive=False, message=f"Failed to query sandbox state: {e}")
+        if self._command_handle is not None:
+            exit_code = getattr(self._command_handle, "exit_code", None)
+            if exit_code is not None:
+                output = self._get_bootstrap_output()
+                msg = f"Bootstrap process terminated with exit code {exit_code}.\n{output}"
+                raise RuntimeError(msg)
         return await self._runtime.is_alive(timeout=timeout)
 
     async def _wait_until_alive(self, timeout: float):
@@ -287,6 +306,14 @@ class InspireSandboxDeployment(AbstractDeployment):
         t0 = time.time()
         try:
             await self._wait_until_alive(timeout=self._config.startup_timeout)
+        except TimeoutError as e:
+            output = self._get_bootstrap_output()
+            self.logger.error(
+                "SWE-ReX bootstrap did not start within timeout. Bootstrap output:\n%s",
+                output or "(no output captured)",
+            )
+            await self.stop()
+            raise
         except Exception:
             await self.stop()
             raise
