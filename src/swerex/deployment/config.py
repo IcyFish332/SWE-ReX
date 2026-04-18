@@ -318,6 +318,17 @@ class InspireSandboxDeploymentConfig(BaseModel):
     stop_policy: Literal["kill", "keep"] = "kill"
     """Whether stopping the deployment kills the sandbox or leaves it running."""
 
+    start_retries: int = 0
+    """Number of times to retry sandbox creation + bootstrap if the initial
+    attempt fails (e.g. TimeoutError).  0 means no retry (single attempt)."""
+
+    spec_code: str = "g.c4"
+    """Sandbox resource specification code used when building templates.
+
+    Available specs: g.c1 (1 vCPU / 4 GB), g.c2 (2 vCPU / 8 GB),
+    g.c4 (4 vCPU / 16 GB).
+    """
+
     type: Literal["inspire_sandbox"] = "inspire_sandbox"
     """Discriminator for (de)serialization/CLI. Do not change."""
 

@@ -249,11 +249,8 @@ class InspireSandboxDeployment(AbstractDeployment):
     async def _wait_until_alive(self, timeout: float):
         return await _wait_until_alive(self.is_alive, timeout=timeout, function_timeout=self._config.runtime_timeout)
 
-    async def start(self):
-        if self._runtime is not None and self._sandbox is not None:
-            self.logger.warning("Deployment is already started. Ignoring duplicate start() call.")
-            return
-
+    async def _start_once(self):
+        """Create a sandbox, run the bootstrap command, and wait for the runtime."""
         from inspire_sandbox import Sandbox
 
         self._hooks.on_custom_step("Allocating Inspire sandbox")
@@ -318,6 +315,34 @@ class InspireSandboxDeployment(AbstractDeployment):
             await self.stop()
             raise
         self.logger.info("Runtime started in %.2fs", time.time() - t0)
+
+    async def start(self):
+        if self._runtime is not None and self._sandbox is not None:
+            self.logger.warning("Deployment is already started. Ignoring duplicate start() call.")
+            return
+
+        max_attempts = 1 + self._config.start_retries
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                await self._start_once()
+                return
+            except (TimeoutError, RuntimeError) as e:
+                last_error = e
+                self.logger.warning(
+                    "Bootstrap attempt %d/%d failed: %s",
+                    attempt, max_attempts, e,
+                )
+                await self.stop()
+                if attempt < max_attempts:
+                    self.logger.info("Retrying sandbox creation...")
+                self._runtime = None
+                self._sandbox = None
+                self._command_handle = None
+                self._auth_token = None
+
+        raise last_error  # type: ignore[misc]
 
     async def stop(self):
         if self._runtime is not None:
