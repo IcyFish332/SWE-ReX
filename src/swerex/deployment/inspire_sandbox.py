@@ -297,6 +297,7 @@ class InspireSandboxDeployment(AbstractDeployment):
                 upload_num_retries=self._config.upload_num_retries,
                 upload_retry_delay=self._config.upload_retry_delay,
                 upload_backoff_max=self._config.upload_backoff_max,
+                request_num_retries=self._config.request_num_retries,
             )
         )
 

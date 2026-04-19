@@ -315,6 +315,10 @@ class InspireSandboxDeploymentConfig(BaseModel):
     upload_backoff_max: float = 5.0
     """Maximum delay in seconds between upload retries (exponential backoff cap)."""
 
+    request_num_retries: int = 0
+    """Number of retries for runtime API requests (run_in_session, create_session, etc.).
+    0 means no retry. Helps survive transient 502/504 gateway errors."""
+
     stop_policy: Literal["kill", "keep"] = "kill"
     """Whether stopping the deployment kills the sandbox or leaves it running."""
 

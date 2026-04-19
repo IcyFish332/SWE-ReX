@@ -31,6 +31,10 @@ class RemoteRuntimeConfig(BaseModel):
     extra_headers: dict[str, str] = Field(default_factory=dict)
     """Additional HTTP headers to include in every runtime request."""
 
+    request_num_retries: int = 0
+    """Number of retries for runtime API requests (run_in_session, create_session, etc.).
+    0 means no retry. Helps survive transient 502/504 gateway errors."""
+
     upload_num_retries: int = 0
     """Number of retries for upload requests. 0 means no retry."""
     upload_retry_delay: float = 0.5
