@@ -1,13 +1,13 @@
 import asyncio
+import hashlib
+import hmac
 import logging
+import os
 import shlex
-import time
-import uuid
 from typing import Any
 
 from typing_extensions import Self
 
-from swerex import PACKAGE_NAME, REMOTE_EXECUTABLE_NAME
 from swerex.deployment.abstract import AbstractDeployment
 from swerex.deployment.config import InspireSandboxDeploymentConfig
 from swerex.deployment.hooks.abstract import CombinedDeploymentHook, DeploymentHook
@@ -18,9 +18,181 @@ from swerex.runtime.remote import RemoteRuntime
 from swerex.utils.log import get_logger
 from swerex.utils.wait import _wait_until_alive
 
+# ---------------------------------------------------------------------------
+# Shared module-level helpers
+# ---------------------------------------------------------------------------
+# Bumped whenever the bootstrap contract (install steps / start_cmd / ready
+# check) changes.  Old templates built under an earlier suffix are left
+# alone; consumers recompute template names using this suffix so cached
+# templates that no longer match the current contract are naturally
+# bypassed.
+TEMPLATE_NAME_SUFFIX = "rex1"
 
+_DEFAULT_APT_URL = "http://nexus.sii.shaipower.online/repository/ubuntu/"
+_DEFAULT_PYPI_URL = "http://nexus.sii.shaipower.online/repository/pypi/simple"
+_DEFAULT_PYPI_TRUSTED_HOSTS: tuple[str, ...] = ("nexus.sii.shaipower.online",)
+_DEFAULT_SWEREX_BIN = "/opt/swerex/bin/swerex-remote"
+_DEFAULT_SWEREX_VENV = "/opt/swerex/venv"
+_DEFAULT_SWEREX_PORT = 8000
+
+
+def derive_swerex_auth_token(template_name: str, api_key: str | None) -> str:
+    """Deterministic per-(template, api_key) swerex ``--auth-token``.
+
+    Returns 32 hex chars (the first half of an HMAC-SHA256).  Both the
+    template builder and the Deployment call this with the same inputs so
+    the token baked into the template matches the token the Deployment
+    presents when connecting.  When ``api_key`` is ``None``/empty, a
+    placeholder key keeps the derivation well-defined.
+    """
+    key_bytes = (api_key or "").encode("utf-8") or b"no-api-key"
+    return hmac.new(key_bytes, template_name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+
+
+def _build_apt_setup(apt_source_url: str | None) -> str:
+    """Shell snippet that rewrites Debian/Ubuntu apt sources to ``apt_source_url``.
+
+    When ``apt_source_url`` is empty, returns an empty string so callers can
+    skip the mirror-rewrite step entirely.
+    """
+    if not apt_source_url:
+        return ""
+
+    apt_url_ubuntu = apt_source_url
+    apt_url_debian = apt_source_url
+    apt_url_debian_security = apt_source_url
+    if "ubuntu" in apt_source_url:
+        apt_url_debian = apt_source_url.replace("ubuntu", "debian")
+        apt_url_debian_security = apt_source_url.replace("ubuntu", "debian-security")
+    elif "debian" in apt_source_url and "debian-security" not in apt_source_url:
+        apt_url_debian_security = apt_source_url.replace("debian", "debian-security")
+        apt_url_ubuntu = apt_source_url.replace("debian", "ubuntu")
+
+    return (
+        f"(sed -i 's|http://archive.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        f"(sed -i 's|http://security.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        f"(sed -i 's|http://deb.debian.org/debian|{apt_url_debian}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        f"(sed -i 's|http://security.debian.org/debian-security|{apt_url_debian_security}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        f"(sed -i 's|https://deb.debian.org/debian|{apt_url_debian}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        f"(sed -i 's|https://security.debian.org/debian-security|{apt_url_debian_security}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
+        "if [ -d /etc/apt/sources.list.d ]; then\n"
+        "  find /etc/apt/sources.list.d -type f -name '*.sources' -print0 2>/dev/null | \\\n"
+        "    xargs -0 -r sed -i "
+        f"-e 's|http://deb.debian.org/debian|{apt_url_debian}|g' "
+        f"-e 's|https://deb.debian.org/debian|{apt_url_debian}|g' "
+        f"-e 's|http://security.debian.org/debian-security|{apt_url_debian_security}|g' "
+        f"-e 's|https://security.debian.org/debian-security|{apt_url_debian_security}|g' "
+        f"-e 's|http://archive.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' "
+        f"-e 's|http://security.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' || true\n"
+        "fi"
+    )
+
+
+def _build_pip_flags(pypi_index_url: str | None, pypi_trusted_hosts: list[str]) -> str:
+    flags: list[str] = []
+    if pypi_index_url:
+        flags.extend(["-i", pypi_index_url])
+    for host in pypi_trusted_hosts:
+        flags.extend(["--trusted-host", host])
+    return " ".join(shlex.quote(f) for f in flags)
+
+
+def build_swerex_install_script(
+    *,
+    apt_source_url: str | None,
+    pypi_index_url: str | None,
+    pypi_trusted_hosts: list[str],
+    swerex_bin: str,
+    swerex_venv: str = _DEFAULT_SWEREX_VENV,
+) -> str:
+    """Bash script that apt-installs python3.11 + pip-installs swe-rex into a venv.
+
+    Intended for use inside ``template.run_cmd(..., user="root")`` at
+    template build time.  The platform layer-caches RUN steps, so the
+    amortised cost on a rebuild is ~0.
+    """
+    apt_setup = _build_apt_setup(apt_source_url)
+    pip_flags = _build_pip_flags(pypi_index_url, pypi_trusted_hosts)
+    bin_dir = os.path.dirname(swerex_bin) or "/opt/swerex/bin"
+    venv_q = shlex.quote(swerex_venv)
+    bin_q = shlex.quote(swerex_bin)
+    bin_dir_q = shlex.quote(bin_dir)
+
+    lines: list[str] = [
+        "set -euo pipefail",
+    ]
+    if apt_setup:
+        lines.extend(apt_setup.splitlines())
+    lines.extend(
+        [
+            "DEBIAN_FRONTEND=noninteractive apt-get update",
+            "DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends "
+            "python3.11 python3.11-venv python3.11-distutils ca-certificates curl",
+            f"rm -rf {venv_q}",
+            f"python3.11 -m venv {venv_q}",
+            f"{venv_q}/bin/python -m pip install --upgrade pip",
+            f"{venv_q}/bin/python -m pip install {pip_flags} swe-rex".rstrip(),
+            f"mkdir -p {bin_dir_q}",
+            f"ln -sf {venv_q}/bin/swerex-remote {bin_q}",
+            # Fail fast if the symlink target is missing.
+            f"test -x {bin_q}",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def append_swerex_bootstrap(
+    template: Any,  # TemplateBuilder (from inspire_sandbox)
+    *,
+    token: str,
+    swerex_bin: str = _DEFAULT_SWEREX_BIN,
+    swerex_port: int = _DEFAULT_SWEREX_PORT,
+    apt_source_url: str | None = _DEFAULT_APT_URL,
+    pypi_index_url: str | None = _DEFAULT_PYPI_URL,
+    pypi_trusted_hosts: list[str] | None = None,
+    swerex_venv: str = _DEFAULT_SWEREX_VENV,
+) -> Any:  # TemplateFinal (from inspire_sandbox)
+    """Chain the swerex install step + ``set_start_cmd`` onto a Template builder.
+
+    Returns the ``TemplateFinal`` instance for use with ``Template.build(...)``.
+    """
+    from inspire_sandbox import wait_for_url
+
+    hosts = list(pypi_trusted_hosts) if pypi_trusted_hosts is not None else list(
+        _DEFAULT_PYPI_TRUSTED_HOSTS
+    )
+    install_script = build_swerex_install_script(
+        apt_source_url=apt_source_url,
+        pypi_index_url=pypi_index_url,
+        pypi_trusted_hosts=hosts,
+        swerex_bin=swerex_bin,
+        swerex_venv=swerex_venv,
+    )
+    start_cmd = (
+        f"exec {shlex.quote(swerex_bin)} "
+        f"--port {swerex_port} --auth-token {shlex.quote(token)}"
+    )
+    ready_cmd = wait_for_url(f"http://localhost:{swerex_port}/is_alive", 200)
+    return (
+        template
+        .set_user("root")
+        .run_cmd(install_script, user="root")
+        .set_start_cmd(start_cmd, ready_cmd)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Deployment
+# ---------------------------------------------------------------------------
 class InspireSandboxDeployment(AbstractDeployment):
-    """Managed deployment backed by Inspire Sandbox."""
+    """Managed deployment backed by Inspire Sandbox.
+
+    The bootstrap (apt install python3.11, pip install swe-rex, exec swerex-remote)
+    is baked into the template at build time via
+    :func:`append_swerex_bootstrap`.  ``_start_once`` therefore only needs
+    to create the sandbox and connect a :class:`RemoteRuntime` — the
+    service is already listening inside the snapshot.
+    """
 
     def __init__(
         self,
@@ -31,7 +203,6 @@ class InspireSandboxDeployment(AbstractDeployment):
         self._config = InspireSandboxDeploymentConfig(**kwargs)
         self._runtime: RemoteRuntime | None = None
         self._sandbox: Any | None = None
-        self._command_handle: Any | None = None
         self._auth_token: str | None = None
         self.logger = logger or get_logger("rex-deploy")
         self._hooks = CombinedDeploymentHook()
@@ -43,8 +214,19 @@ class InspireSandboxDeployment(AbstractDeployment):
     def from_config(cls, config: InspireSandboxDeploymentConfig) -> Self:
         return cls(**config.model_dump())
 
-    def _get_token(self) -> str:
-        return str(uuid.uuid4())
+    # -- helpers ------------------------------------------------------------
+    def _resolve_auth_token(self) -> str:
+        if self._config.swerex_auth_token:
+            return self._config.swerex_auth_token
+        if not self._config.template:
+            # When attaching to an existing sandbox by ID (no template), we
+            # can't derive a token — caller must set swerex_auth_token.
+            raise ValueError(
+                "swerex_auth_token must be set explicitly when connecting "
+                "to an existing sandbox_id without a template name."
+            )
+        api_key = self._config.api_key or os.getenv("SBX_API_KEY")
+        return derive_swerex_auth_token(self._config.template, api_key)
 
     def _sdk_api_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {}
@@ -76,160 +258,7 @@ class InspireSandboxDeployment(AbstractDeployment):
             headers.setdefault("sbx-traffic-access-token", self._sandbox.traffic_access_token)
         return headers
 
-    def _command_envs(self) -> dict[str, str] | None:
-        envs = dict(self._config.bootstrap_envs)
-        if self._config.pypi_index_url:
-            envs.setdefault("PIP_INDEX_URL", self._config.pypi_index_url)
-        if self._config.pypi_trusted_hosts:
-            envs.setdefault("PIP_TRUSTED_HOST", " ".join(self._config.pypi_trusted_hosts))
-        return envs or None
-
-    def _get_apt_setup_cmd(self) -> str:
-        apt_url = self._config.apt_source_url
-        if not apt_url:
-            return ""
-
-        apt_url_ubuntu = apt_url
-        apt_url_debian = apt_url
-        apt_url_debian_security = apt_url
-        if "ubuntu" in apt_url:
-            apt_url_debian = apt_url.replace("ubuntu", "debian")
-            apt_url_debian_security = apt_url.replace("ubuntu", "debian-security")
-        elif "debian" in apt_url and "debian-security" not in apt_url:
-            apt_url_debian_security = apt_url.replace("debian", "debian-security")
-            apt_url_ubuntu = apt_url.replace("debian", "ubuntu")
-
-        return (
-            f"(sed -i 's|http://archive.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            f"(sed -i 's|http://security.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            f"(sed -i 's|http://deb.debian.org/debian|{apt_url_debian}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            f"(sed -i 's|http://security.debian.org/debian-security|{apt_url_debian_security}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            f"(sed -i 's|https://deb.debian.org/debian|{apt_url_debian}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            f"(sed -i 's|https://security.debian.org/debian-security|{apt_url_debian_security}|g' /etc/apt/sources.list 2>/dev/null || true)\n"
-            "if [ -d /etc/apt/sources.list.d ]; then\n"
-            "  find /etc/apt/sources.list.d -type f -name '*.sources' -print0 2>/dev/null | \\\n"
-            "    xargs -0 -r sed -i "
-            f"-e 's|http://deb.debian.org/debian|{apt_url_debian}|g' "
-            f"-e 's|https://deb.debian.org/debian|{apt_url_debian}|g' "
-            f"-e 's|http://security.debian.org/debian-security|{apt_url_debian_security}|g' "
-            f"-e 's|https://security.debian.org/debian-security|{apt_url_debian_security}|g' "
-            f"-e 's|http://archive.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' "
-            f"-e 's|http://security.ubuntu.com/ubuntu/|{apt_url_ubuntu}|g' || true\n"
-            "fi"
-        )
-
-    def _get_pip_install_flags(self) -> str:
-        flags: list[str] = []
-        if self._config.pypi_index_url:
-            flags.extend(["-i", self._config.pypi_index_url])
-        for host in self._config.pypi_trusted_hosts:
-            flags.extend(["--trusted-host", host])
-        return " ".join(shlex.quote(flag) for flag in flags)
-
-    def _get_swerex_start_cmd(self, token: str) -> str:
-        port = self._config.swerex_port
-        apt_setup = self._get_apt_setup_cmd()
-        pip_install_flags = self._get_pip_install_flags()
-        preferred_bin = shlex.quote(self._config.swerex_bin)
-        package = shlex.quote(PACKAGE_NAME)
-        executable = shlex.quote(REMOTE_EXECUTABLE_NAME)
-        venv_dir = "/tmp/swerex-venv"
-        lines = [
-            "set -euo pipefail",
-            f"REX_ARGS='--port {port} --auth-token {token}'",
-            "ensure_python_bin() {",
-            "  command -v python3 || command -v python || true",
-            "}",
-            "python_is_modern() {",
-            '  "$1" -c "import sys; sys.exit(0 if sys.version_info >= (3, 10) else 1)" >/dev/null 2>&1',
-            "}",
-            "ensure_pipx() {",
-            "  if command -v pipx >/dev/null 2>&1; then",
-            "    return 0",
-            "  fi",
-            "  if ! command -v apt-get >/dev/null 2>&1; then",
-            "    return 1",
-            "  fi",
-        ]
-        if apt_setup:
-            lines.extend(apt_setup.splitlines())
-        lines.extend(
-            [
-                "  apt-get update",
-                "  apt-get install -y pipx",
-                "  command -v pipx >/dev/null 2>&1",
-                "}",
-                "try_with_pipx() {",
-                "  local python_bin=\"$1\"",
-                "  if ! ensure_pipx; then",
-                "    return 1",
-                "  fi",
-                f"  PIPX_DEFAULT_PYTHON=\"$python_bin\" pipx run --spec {package} {REMOTE_EXECUTABLE_NAME} $REX_ARGS",
-                "}",
-                "try_with_venv() {",
-                "  local python_bin=\"$1\"",
-                f"  rm -rf {shlex.quote(venv_dir)}",
-                f"  \"$python_bin\" -m venv {shlex.quote(venv_dir)}",
-                f"  \"{venv_dir}/bin/python\" -m pip install --upgrade pip",
-                f"  \"{venv_dir}/bin/python\" -m pip install {pip_install_flags} {package}".rstrip(),
-                f"  exec \"{venv_dir}/bin/{REMOTE_EXECUTABLE_NAME}\" $REX_ARGS",
-                "}",
-                f"if [ -x {preferred_bin} ]; then",
-                f"  exec {preferred_bin} $REX_ARGS",
-                "fi",
-                f"if command -v {executable} >/dev/null 2>&1; then",
-                f"  exec {executable} $REX_ARGS",
-                "fi",
-                'PYTHON_BIN="$(ensure_python_bin)"',
-                'if [ -n "${PYTHON_BIN}" ] && python_is_modern "${PYTHON_BIN}"; then',
-                '  if try_with_pipx "${PYTHON_BIN}"; then',
-                "    exit 0",
-                "  fi",
-                '  try_with_venv "${PYTHON_BIN}"',
-                "fi",
-                "if command -v python3.11 >/dev/null 2>&1; then",
-                "  PYTHON_BIN=python3.11",
-                "else",
-                "  if ! command -v apt-get >/dev/null 2>&1; then",
-                '    echo "python3.11 not available and apt-get is missing" >&2',
-                "    exit 1",
-                "  fi",
-            ]
-        )
-        if apt_setup:
-            lines.extend(apt_setup.splitlines())
-        lines.extend(
-            [
-                "  apt-get update",
-                "  apt-get install -y python3.11 python3.11-venv pipx",
-                "  PYTHON_BIN=python3.11",
-                "fi",
-                'if ! python_is_modern "${PYTHON_BIN}"; then',
-                '  echo "No compatible Python (>=3.10) available for SWE-ReX bootstrap" >&2',
-                "  exit 1",
-                "fi",
-                'if try_with_pipx "${PYTHON_BIN}"; then',
-                "  exit 0",
-                "fi",
-                'try_with_venv "${PYTHON_BIN}"',
-            ]
-        )
-        script = "\n".join(lines)
-        return "bash -lc " + shlex.quote(script)
-
-    def _get_bootstrap_output(self) -> str:
-        """Read accumulated stdout/stderr from the bootstrap command handle."""
-        if self._command_handle is None:
-            return ""
-        stdout = getattr(self._command_handle, "_stdout", "") or ""
-        stderr = getattr(self._command_handle, "_stderr", "") or ""
-        parts = []
-        if stdout:
-            parts.append(f"stdout:\n{stdout}")
-        if stderr:
-            parts.append(f"stderr:\n{stderr}")
-        return "\n".join(parts)
-
+    # -- lifecycle ----------------------------------------------------------
     async def is_alive(self, *, timeout: float | None = None) -> IsAliveResponse:
         if self._runtime is None or self._sandbox is None:
             raise DeploymentNotStartedError()
@@ -238,19 +267,19 @@ class InspireSandboxDeployment(AbstractDeployment):
                 return IsAliveResponse(is_alive=False, message="Inspire sandbox is not running")
         except Exception as e:
             return IsAliveResponse(is_alive=False, message=f"Failed to query sandbox state: {e}")
-        if self._command_handle is not None:
-            exit_code = getattr(self._command_handle, "exit_code", None)
-            if exit_code is not None:
-                output = self._get_bootstrap_output()
-                msg = f"Bootstrap process terminated with exit code {exit_code}.\n{output}"
-                raise RuntimeError(msg)
         return await self._runtime.is_alive(timeout=timeout)
 
     async def _wait_until_alive(self, timeout: float):
-        return await _wait_until_alive(self.is_alive, timeout=timeout, function_timeout=self._config.runtime_timeout)
+        return await _wait_until_alive(
+            self.is_alive, timeout=timeout, function_timeout=self._config.runtime_timeout
+        )
 
     async def _start_once(self):
-        """Create a sandbox, run the bootstrap command, and wait for the runtime."""
+        """Create (or connect to) a sandbox and attach a RemoteRuntime.
+
+        No post-create ``commands.run`` is needed: swerex-remote is already
+        running inside the template snapshot.
+        """
         from inspire_sandbox import Sandbox
 
         self._hooks.on_custom_step("Allocating Inspire sandbox")
@@ -273,16 +302,7 @@ class InspireSandboxDeployment(AbstractDeployment):
                 **sdk_params,
             )
 
-        self._auth_token = self._get_token()
-        self._hooks.on_custom_step("Starting SWE-ReX inside sandbox")
-        self._command_handle = self._sandbox.commands.run(
-            self._get_swerex_start_cmd(self._auth_token),
-            background=True,
-            envs=self._command_envs(),
-            user=self._config.bootstrap_user,
-            timeout=None,
-            request_timeout=self._config.request_timeout,
-        )
+        self._auth_token = self._resolve_auth_token()
 
         scheme = "http" if self._sandbox.connection_config.debug else "https"
         host = f"{scheme}://{self._sandbox.get_host(self._config.swerex_port)}"
@@ -301,21 +321,11 @@ class InspireSandboxDeployment(AbstractDeployment):
             )
         )
 
-        t0 = time.time()
         try:
             await self._wait_until_alive(timeout=self._config.startup_timeout)
-        except TimeoutError as e:
-            output = self._get_bootstrap_output()
-            self.logger.error(
-                "SWE-ReX bootstrap did not start within timeout. Bootstrap output:\n%s",
-                output or "(no output captured)",
-            )
-            await self.stop()
-            raise
         except Exception:
             await self.stop()
             raise
-        self.logger.info("Runtime started in %.2fs", time.time() - t0)
 
     async def start(self):
         if self._runtime is not None and self._sandbox is not None:
@@ -340,7 +350,6 @@ class InspireSandboxDeployment(AbstractDeployment):
                     self.logger.info("Retrying sandbox creation...")
                 self._runtime = None
                 self._sandbox = None
-                self._command_handle = None
                 self._auth_token = None
 
         raise last_error  # type: ignore[misc]
@@ -357,14 +366,6 @@ class InspireSandboxDeployment(AbstractDeployment):
             finally:
                 self._runtime = None
 
-        if self._command_handle is not None and self._config.stop_policy == "keep":
-            try:
-                self._command_handle.kill()
-            except Exception:
-                self.logger.warning("Failed to kill sandbox background command", exc_info=False)
-            finally:
-                self._command_handle = None
-
         if self._sandbox is not None and self._config.stop_policy == "kill":
             try:
                 self._sandbox.kill(**self._sdk_api_params())
@@ -372,7 +373,6 @@ class InspireSandboxDeployment(AbstractDeployment):
                 self.logger.warning("Failed to kill sandbox cleanly", exc_info=False)
 
         self._sandbox = None
-        self._command_handle = None
         self._auth_token = None
 
     @property

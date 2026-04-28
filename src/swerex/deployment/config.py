@@ -242,8 +242,16 @@ class InspireSandboxDeploymentConfig(BaseModel):
     allow_internet_access: bool = True
     """Whether the sandbox can reach the public internet."""
 
-    allow_public_traffic: bool = True
-    """Whether the public sandbox host can be accessed without the platform traffic token."""
+    allow_public_traffic: bool = False
+    """Whether the public sandbox host can be accessed without the platform traffic token.
+
+    Defaults to ``False`` because the SWE-ReX bootstrap is baked into the
+    template at build time and therefore carries a template-wide auth token
+    (see ``swerex_auth_token`` below).  With ``allow_public_traffic=False``,
+    the per-sandbox ``sandbox.traffic_access_token`` enforced by the
+    platform gateway becomes the primary access gate; the swerex
+    ``--auth-token`` is a secondary identity check.
+    """
 
     metadata: dict[str, str] = Field(default_factory=dict)
     """Metadata attached to newly created sandboxes."""
@@ -277,6 +285,20 @@ class InspireSandboxDeploymentConfig(BaseModel):
 
     swerex_bin: str = "/opt/swerex/bin/swerex-remote"
     """Preferred path to a preinstalled SWE-ReX server binary inside the sandbox."""
+
+    swerex_auth_token: str = ""
+    """Explicit swerex ``--auth-token`` baked into the template at build time.
+
+    When empty (default), a deterministic token is derived at runtime from
+    ``(api_key, template_name)`` via ``derive_swerex_auth_token`` — the same
+    value is computed by the template builder (SWE-agent, SWE-bench,
+    ``scripts/build_templates.py``) so both sides agree.
+
+    ⚠️  Changing any of ``apt_source_url``, ``pypi_index_url``,
+    ``pypi_trusted_hosts``, ``swerex_bin``, ``swerex_port``, or
+    ``swerex_auth_token`` requires **rebuilding the template** — these
+    values are captured inside ``Template.set_start_cmd`` at build time.
+    """
 
     apt_source_url: str | None = "http://nexus.sii.shaipower.online/repository/ubuntu/"
     """Ubuntu/Debian mirror used when bootstrap needs apt-get.
