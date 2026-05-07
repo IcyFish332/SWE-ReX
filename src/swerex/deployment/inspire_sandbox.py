@@ -26,7 +26,7 @@ from swerex.utils.wait import _wait_until_alive
 # alone; consumers recompute template names using this suffix so cached
 # templates that no longer match the current contract are naturally
 # bypassed.
-TEMPLATE_NAME_SUFFIX = "rex1"
+TEMPLATE_NAME_SUFFIX = "rex2"
 
 _DEFAULT_APT_URL = "http://nexus.sii.shaipower.online/repository/ubuntu/"
 _DEFAULT_PYPI_URL = "http://nexus.sii.shaipower.online/repository/pypi/simple"
@@ -156,8 +156,6 @@ def append_swerex_bootstrap(
 
     Returns the ``TemplateFinal`` instance for use with ``Template.build(...)``.
     """
-    from inspire_sandbox import wait_for_url
-
     hosts = list(pypi_trusted_hosts) if pypi_trusted_hosts is not None else list(
         _DEFAULT_PYPI_TRUSTED_HOSTS
     )
@@ -172,7 +170,15 @@ def append_swerex_bootstrap(
         f"exec {shlex.quote(swerex_bin)} "
         f"--port {swerex_port} --auth-token {shlex.quote(token)}"
     )
-    ready_cmd = wait_for_url(f"http://localhost:{swerex_port}/is_alive", 200)
+    # swerex-remote's authenticate() middleware rejects any request missing
+    # ``X-API-Key: <token>``, including ``/is_alive``.  The built-in
+    # ``wait_for_url`` helper doesn't support headers, so we pass a raw
+    # curl string instead.
+    ready_cmd = (
+        f'curl -s -o /dev/null -w "%{{http_code}}" '
+        f'-H "X-API-Key: {token}" '
+        f'http://localhost:{swerex_port}/is_alive | grep -q "200"'
+    )
     return (
         template
         .set_user("root")

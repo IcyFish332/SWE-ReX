@@ -54,7 +54,7 @@ def test_derive_swerex_auth_token_handles_empty_api_key():
 def test_template_name_suffix_constant():
     from swerex.deployment.inspire_sandbox import TEMPLATE_NAME_SUFFIX
 
-    assert TEMPLATE_NAME_SUFFIX == "rex1"
+    assert TEMPLATE_NAME_SUFFIX == "rex2"
 
 
 def test_append_swerex_bootstrap_builds_valid_template():
@@ -89,10 +89,13 @@ def test_append_swerex_bootstrap_builds_valid_template():
     assert "--auth-token" in serialized["startCmd"]
     # swerex binary path referenced.
     assert "/opt/swerex/bin/swerex-remote" in serialized["startCmd"]
-    # ready_cmd should curl /is_alive.
+    # ready_cmd should curl /is_alive AND carry X-API-Key so swerex-remote's
+    # authenticate() middleware lets it through.
     assert "/is_alive" in serialized["readyCmd"]
     assert "localhost:8000" in serialized["readyCmd"]
     assert "curl" in serialized["readyCmd"]
+    assert "X-API-Key" in serialized["readyCmd"]
+    assert "deadbeefcafefeed" * 2 in serialized["readyCmd"]
 
     # Install script must be captured in steps (as a RUN instruction).
     run_steps = [s for s in serialized["steps"] if s["type"] == "RUN"]
