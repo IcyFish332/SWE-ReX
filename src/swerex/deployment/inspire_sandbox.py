@@ -22,11 +22,27 @@ from swerex.utils.wait import _wait_until_alive
 # Shared module-level helpers
 # ---------------------------------------------------------------------------
 # Bumped whenever the bootstrap contract (install steps / start_cmd / ready
-# check) changes.  Old templates built under an earlier suffix are left
-# alone; consumers recompute template names using this suffix so cached
-# templates that no longer match the current contract are naturally
-# bypassed.
-TEMPLATE_NAME_SUFFIX = "rex2"
+# check / auth-token derivation) changes.  Old templates built under an
+# earlier suffix are left alone; consumers recompute template names using
+# this suffix so cached templates that no longer match the current contract
+# are naturally bypassed.
+#
+# rex2 → rex3: drop ``SBX_API_KEY`` from the HMAC key material used to
+#              derive ``--auth-token``.  Rebaking a key-dependent token
+#              into the template made every sandbox un-connectable as
+#              soon as the API key rotated (platform re-provisioning of
+#              a notebook silently rewrites ``SBX_API_KEY``), which
+#              surfaced far from the cause as mass 401s after a 900s
+#              startup timeout.  The token is a secondary identity check
+#              only — actual access control is ``sbx-traffic-access-token``
+#              per-sandbox — so a per-(template, salt) HMAC is sufficient.
+TEMPLATE_NAME_SUFFIX = "rex3"
+
+# Fixed HMAC salt used to derive the swerex ``--auth-token`` from a template
+# name.  Opaque random bytes, not user-visible; exists only to keep tokens
+# unguessable for a given template name even though the token is itself a
+# secondary check behind ``sbx-traffic-access-token``.
+_SWEREX_TOKEN_SALT = b"swerex-template-token-v1"
 
 _DEFAULT_APT_URL = "http://nexus.sii.shaipower.online/repository/ubuntu/"
 _DEFAULT_PYPI_URL = "http://nexus.sii.shaipower.online/repository/pypi/simple"
@@ -36,17 +52,22 @@ _DEFAULT_SWEREX_VENV = "/opt/swerex/venv"
 _DEFAULT_SWEREX_PORT = 8000
 
 
-def derive_swerex_auth_token(template_name: str, api_key: str | None) -> str:
-    """Deterministic per-(template, api_key) swerex ``--auth-token``.
+def derive_swerex_auth_token(template_name: str) -> str:
+    """Deterministic per-template swerex ``--auth-token``.
 
-    Returns 32 hex chars (the first half of an HMAC-SHA256).  Both the
-    template builder and the Deployment call this with the same inputs so
-    the token baked into the template matches the token the Deployment
-    presents when connecting.  When ``api_key`` is ``None``/empty, a
-    placeholder key keeps the derivation well-defined.
+    Returns 32 hex chars (the first half of an HMAC-SHA256) computed from
+    a fixed module-level salt and the template name.  Both the template
+    builder and the Deployment call this with the same input so the token
+    baked into the template matches the token the Deployment presents
+    when connecting.
+
+    This derivation is deliberately **independent of ``SBX_API_KEY``** so
+    that API-key rotation (including silent rotation caused by platform
+    re-provisioning of a notebook) does not invalidate existing templates.
     """
-    key_bytes = (api_key or "").encode("utf-8") or b"no-api-key"
-    return hmac.new(key_bytes, template_name.encode("utf-8"), hashlib.sha256).hexdigest()[:32]
+    return hmac.new(
+        _SWEREX_TOKEN_SALT, template_name.encode("utf-8"), hashlib.sha256
+    ).hexdigest()[:32]
 
 
 def _build_apt_setup(apt_source_url: str | None) -> str:
@@ -231,8 +252,7 @@ class InspireSandboxDeployment(AbstractDeployment):
                 "swerex_auth_token must be set explicitly when connecting "
                 "to an existing sandbox_id without a template name."
             )
-        api_key = self._config.api_key or os.getenv("SBX_API_KEY")
-        return derive_swerex_auth_token(self._config.template, api_key)
+        return derive_swerex_auth_token(self._config.template)
 
     def _sdk_api_params(self) -> dict[str, Any]:
         params: dict[str, Any] = {}

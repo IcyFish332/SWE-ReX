@@ -290,9 +290,12 @@ class InspireSandboxDeploymentConfig(BaseModel):
     """Explicit swerex ``--auth-token`` baked into the template at build time.
 
     When empty (default), a deterministic token is derived at runtime from
-    ``(api_key, template_name)`` via ``derive_swerex_auth_token`` — the same
-    value is computed by the template builder (SWE-agent, SWE-bench,
-    ``scripts/build_templates.py``) so both sides agree.
+    ``template_name`` via ``derive_swerex_auth_token`` (with a fixed
+    module-level salt) — the same value is computed by the template
+    builder (SWE-agent, SWE-bench, ``scripts/build_templates.py``) so both
+    sides agree.  The derivation deliberately does **not** depend on
+    ``SBX_API_KEY`` so that API-key rotation does not invalidate existing
+    templates.
 
     ⚠️  Changing any of ``apt_source_url``, ``pypi_index_url``,
     ``pypi_trusted_hosts``, ``swerex_bin``, ``swerex_port``, or

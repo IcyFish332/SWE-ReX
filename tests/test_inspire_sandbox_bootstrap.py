@@ -18,43 +18,53 @@ pytest.importorskip("inspire_sandbox")
 def test_derive_swerex_auth_token_is_deterministic():
     from swerex.deployment.inspire_sandbox import derive_swerex_auth_token
 
-    a = derive_swerex_auth_token("swebench-django-11149-g-c4-rex1", "api-key-xyz")
-    b = derive_swerex_auth_token("swebench-django-11149-g-c4-rex1", "api-key-xyz")
+    a = derive_swerex_auth_token("swebench-django-11149-g-c4-rex3")
+    b = derive_swerex_auth_token("swebench-django-11149-g-c4-rex3")
     assert a == b
     # 32 hex chars (128 bits, half an HMAC-SHA256)
     assert len(a) == 32
     assert all(c in "0123456789abcdef" for c in a)
 
 
-def test_derive_swerex_auth_token_depends_on_api_key():
-    from swerex.deployment.inspire_sandbox import derive_swerex_auth_token
-
-    a = derive_swerex_auth_token("swebench-x-rex1", "key-A")
-    b = derive_swerex_auth_token("swebench-x-rex1", "key-B")
-    assert a != b
-
-
 def test_derive_swerex_auth_token_depends_on_template_name():
     from swerex.deployment.inspire_sandbox import derive_swerex_auth_token
 
-    a = derive_swerex_auth_token("swebench-x-rex1", "key-A")
-    b = derive_swerex_auth_token("swebench-y-rex1", "key-A")
+    a = derive_swerex_auth_token("swebench-x-rex3")
+    b = derive_swerex_auth_token("swebench-y-rex3")
     assert a != b
 
 
-def test_derive_swerex_auth_token_handles_empty_api_key():
+def test_derive_swerex_auth_token_independent_of_environment():
+    """The token must not depend on SBX_API_KEY or any other environment state.
+
+    Regression test for an earlier contract where the HMAC key was
+    ``SBX_API_KEY``: a silent rotation of the key (e.g. platform
+    re-provisioning a notebook) made every pre-built template
+    un-connectable.  The current derivation uses only ``template_name``
+    and a fixed module-level salt.
+    """
+    import os
+
     from swerex.deployment.inspire_sandbox import derive_swerex_auth_token
 
-    # Must not raise when api_key is None / "" (fallback deterministic).
-    a = derive_swerex_auth_token("swebench-x-rex1", None)
-    b = derive_swerex_auth_token("swebench-x-rex1", "")
-    assert len(a) == 32 and len(b) == 32
+    prev = os.environ.get("SBX_API_KEY")
+    try:
+        os.environ["SBX_API_KEY"] = "key-A"
+        a = derive_swerex_auth_token("swebench-x-rex3")
+        os.environ["SBX_API_KEY"] = "key-B"
+        b = derive_swerex_auth_token("swebench-x-rex3")
+    finally:
+        if prev is None:
+            os.environ.pop("SBX_API_KEY", None)
+        else:
+            os.environ["SBX_API_KEY"] = prev
+    assert a == b
 
 
 def test_template_name_suffix_constant():
     from swerex.deployment.inspire_sandbox import TEMPLATE_NAME_SUFFIX
 
-    assert TEMPLATE_NAME_SUFFIX == "rex2"
+    assert TEMPLATE_NAME_SUFFIX == "rex3"
 
 
 def test_append_swerex_bootstrap_builds_valid_template():
